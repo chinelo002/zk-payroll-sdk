@@ -116,4 +116,70 @@ describe("Cross-Currency Payout Rounding Safeguards (#694)", () => {
       expect(report.cumulativeDriftBps).toBe(0);
     });
   });
+
+  describe("computeTargetPayoutAmount precision beyond Number.MAX_SAFE_INTEGER (#767)", () => {
+    it("never silently flips an odd bigint source amount to an even one via a float round-trip", () => {
+      // Number(9007199254740993n) === 9007199254740992 (an off-by-one, even
+      // number) — this is the exact bug this fix guards against. At rate
+      // 1.0 with matching decimals, the target amount must equal the
+      // source amount exactly, preserving its odd value.
+      const source = 9007199254740993n;
+      const res = computeTargetPayoutAmount(source, 7, 7, 1.0, "round");
+      expect(res.targetAmount).toBe(source.toString());
+      expect(res.precisionLoss).toBe(false);
+    });
+
+    it("computes an exact result for a large aggregate payroll amount with a non-trivial rate", () => {
+      // A realistic large aggregate: ~901M whole units at 7 decimals,
+      // comfortably past Number.MAX_SAFE_INTEGER, converted at a
+      // non-round exchange rate. Verified against exact bigint math
+      // computed independently of the function under test.
+      const source = 9007199254740993n; // 7 decimals -> ~900.72M whole units
+      const sourceDecimals = 7;
+      const targetDecimals = 7;
+      const rate = "1.0734";
+
+      const res = computeTargetPayoutAmount(source, sourceDecimals, targetDecimals, rate, "floor");
+
+      // Independent exact computation: source * 10734 / 10000, floored.
+      const expected = (source * 10734n) / 10000n;
+      expect(res.targetAmount).toBe(expected.toString());
+    });
+
+    it("still correctly flags genuine precision loss from the rounding mode itself, not the parsing", () => {
+      const res = computeTargetPayoutAmount("10000000", 7, 7, 0.33333333, "floor");
+      expect(res.targetAmount).toBe("3333333");
+      expect(res.precisionLoss).toBe(true);
+    });
+
+    it("produces identical results whether the source amount is passed as a bigint or an equal-value string", () => {
+      const asBigint = computeTargetPayoutAmount(9007199254740993n, 7, 7, "1.0734", "round");
+      const asString = computeTargetPayoutAmount("9007199254740993", 7, 7, "1.0734", "round");
+      expect(asBigint.targetAmount).toBe(asString.targetAmount);
+    });
+
+    it("aggregates totalSourceAmount and totalComputedTargetAmount exactly for a batch containing an amount beyond Number.MAX_SAFE_INTEGER", () => {
+      const items: PayoutRoundingItem[] = [
+        {
+          id: "large-item",
+          sourceAmount: "9007199254740993",
+          sourceDecimals: 7,
+          targetDecimals: 7,
+          exchangeRate: 1.0,
+        },
+        {
+          id: "small-item",
+          sourceAmount: "1000000000",
+          sourceDecimals: 7,
+          targetDecimals: 7,
+          exchangeRate: 1.0,
+        },
+      ];
+
+      const report = validateCrossCurrencyPayoutRounding(items, { maxItemDriftBps: 5 });
+
+      expect(report.totalSourceAmount).toBe("9007200254740993");
+      expect(report.totalComputedTargetAmount).toBe("9007200254740993");
+    });
+  });
 });

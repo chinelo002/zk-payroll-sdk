@@ -7,6 +7,73 @@
 
 export type SettlementRoundingMode = "floor" | "ceil" | "round" | "truncate";
 
+/**
+ * Parses a decimal amount (string, bigint, or number) into an exact
+ * `value * 10^-scale` fixed-point pair, where `value` is a bigint and
+ * `scale` is the number of fractional digits actually present (#767).
+ *
+ * `Number(sourceAmount)` for a bigint source amount silently loses
+ * precision beyond `Number.MAX_SAFE_INTEGER` (2^53 - 1): for example
+ * `Number(9007199254740993n) === 9007199254740992`, an off-by-one that
+ * `computeTargetPayoutAmount`'s own `precisionLoss` flag never catches,
+ * since that flag only compares the float-computed result against its own
+ * rounded value, after the float conversion has already lost precision. A
+ * payroll amount denominated in 7-decimal Stellar base units crosses this
+ * threshold above roughly 900 million whole-token units — a realistic
+ * aggregate batch total, not an edge case. This parser keeps the amount as
+ * an exact bigint through the whole conversion instead.
+ */
+function parseExactDecimal(value: string | bigint | number): { digits: bigint; scale: number } {
+  if (typeof value === "bigint") {
+    return { digits: value, scale: 0 };
+  }
+
+  const text = typeof value === "number" ? value.toString() : value.trim();
+  const negative = text.startsWith("-");
+  const unsigned = negative ? text.slice(1) : text;
+
+  // Normalize exponential notation (e.g. "1.5e3") by expanding it, since the
+  // fractional-digit count below assumes plain decimal notation.
+  const expMatch = /^(\d+)(?:\.(\d+))?e([+-]?\d+)$/i.exec(unsigned);
+  if (expMatch) {
+    const [, intPart, fracPart = "", expPart] = expMatch;
+    const exponent = Number(expPart);
+    const combinedDigits = intPart + fracPart;
+    const pointIndex = intPart.length + exponent;
+    if (pointIndex >= combinedDigits.length) {
+      const padded = combinedDigits.padEnd(pointIndex, "0");
+      return { digits: BigInt((negative ? "-" : "") + padded), scale: 0 };
+    }
+    if (pointIndex <= 0) {
+      const padded = "0".repeat(-pointIndex) + combinedDigits;
+      return {
+        digits: BigInt((negative ? "-" : "") + padded),
+        scale: padded.length,
+      };
+    }
+    return {
+      digits: BigInt((negative ? "-" : "") + combinedDigits),
+      scale: combinedDigits.length - pointIndex,
+    };
+  }
+
+  const dotIndex = unsigned.indexOf(".");
+  if (dotIndex === -1) {
+    if (!/^\d+$/.test(unsigned)) {
+      throw new Error(`Invalid decimal amount: ${value}`);
+    }
+    return { digits: BigInt((negative ? "-" : "") + unsigned), scale: 0 };
+  }
+
+  const intPart = unsigned.slice(0, dotIndex);
+  const fracPart = unsigned.slice(dotIndex + 1);
+  if (!/^\d*$/.test(intPart) || !/^\d+$/.test(fracPart)) {
+    throw new Error(`Invalid decimal amount: ${value}`);
+  }
+  const combined = (intPart || "0") + fracPart;
+  return { digits: BigInt((negative ? "-" : "") + combined), scale: fracPart.length };
+}
+
 export type RoundingSafeguardErrorCode =
   | "INVALID_AMOUNT"
   | "INVALID_DECIMALS"
@@ -80,10 +147,14 @@ export function computeTargetPayoutAmount(
   exchangeRate: number | string,
   roundingMode: SettlementRoundingMode = "round"
 ): { targetAmount: string; precisionLoss: boolean } {
-  const sourceNum = typeof sourceAmount === "bigint" ? Number(sourceAmount) : Number(sourceAmount);
+  // Validate finiteness/sign using Number() only for the check itself; the
+  // actual conversion math below never routes the bigint source amount
+  // through Number() (#767 — see parseExactDecimal's doc comment for why).
+  const sourceFiniteCheck =
+    typeof sourceAmount === "bigint" ? Number(sourceAmount) : Number(sourceAmount);
   const rateNum = Number(exchangeRate);
 
-  if (!Number.isFinite(sourceNum) || sourceNum < 0) {
+  if (!Number.isFinite(sourceFiniteCheck) || sourceFiniteCheck < 0) {
     throw new Error(`Invalid source amount: ${sourceAmount}`);
   }
   if (!Number.isFinite(rateNum) || rateNum <= 0) {
@@ -96,29 +167,51 @@ export function computeTargetPayoutAmount(
     throw new Error(`Invalid target decimals: ${targetDecimals}`);
   }
 
-  // Base conversion calculation in high precision
-  // targetUnits = (sourceUnits / 10^sourceDec) * rate * 10^targetDec
+  // Exact fixed-point conversion:
+  //   targetUnits = (sourceDigits * 10^-sourceScale / 10^sourceDec)
+  //               * (rateDigits * 10^-rateScale)
+  //               * 10^targetDec
+  // Expressed as one bigint numerator over one bigint power-of-ten
+  // denominator, so the only place any rounding happens is the single
+  // final division below, not anywhere in the sourceAmount or rate
+  // representation itself.
+  const source = parseExactDecimal(sourceAmount);
+  const rate = parseExactDecimal(exchangeRate);
+
+  const numerator = source.digits * rate.digits;
   const decimalAdjustment = targetDecimals - sourceDecimals;
-  const rawTarget = sourceNum * rateNum * Math.pow(10, decimalAdjustment);
+  const netExponent = decimalAdjustment - source.scale - rate.scale;
+
+  let scaledNumerator: bigint;
+  let denominator: bigint;
+  if (netExponent >= 0) {
+    scaledNumerator = numerator * 10n ** BigInt(netExponent);
+    denominator = 1n;
+  } else {
+    scaledNumerator = numerator;
+    denominator = 10n ** BigInt(-netExponent);
+  }
+
+  const quotient = scaledNumerator / denominator;
+  const remainder = scaledNumerator % denominator;
 
   let targetRounded: bigint;
-  let hasLoss = false;
-
-  if (roundingMode === "floor" || roundingMode === "truncate") {
-    targetRounded = BigInt(Math.floor(rawTarget));
-    hasLoss = rawTarget !== Math.floor(rawTarget);
+  if (remainder === 0n) {
+    targetRounded = quotient;
+  } else if (roundingMode === "floor" || roundingMode === "truncate") {
+    targetRounded = quotient;
   } else if (roundingMode === "ceil") {
-    targetRounded = BigInt(Math.ceil(rawTarget));
-    hasLoss = rawTarget !== Math.ceil(rawTarget);
+    targetRounded = quotient + 1n;
   } else {
-    // Standard half-up rounding
-    targetRounded = BigInt(Math.round(rawTarget));
-    hasLoss = rawTarget !== Math.round(rawTarget);
+    // Standard half-up rounding: compare the remainder against half the
+    // denominator using exact bigint comparison (2 * remainder vs
+    // denominator), never a float division.
+    targetRounded = remainder * 2n >= denominator ? quotient + 1n : quotient;
   }
 
   return {
     targetAmount: targetRounded.toString(),
-    precisionLoss: hasLoss,
+    precisionLoss: remainder !== 0n,
   };
 }
 
@@ -241,7 +334,9 @@ export function validateCrossCurrencyPayoutRounding(
     );
 
     const computedVal = BigInt(computed.targetAmount);
-    sumSource += BigInt(Math.floor(sourceNum));
+    // Aggregate the exact source digits, not the already-lossy sourceNum
+    // float used only for the finiteness/sign check above (#767).
+    sumSource += parseExactDecimal(item.sourceAmount).digits;
     sumComputedTarget += computedVal;
 
     let itemValid = true;
