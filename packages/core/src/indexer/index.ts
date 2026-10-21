@@ -1,6 +1,6 @@
 export { ContractStateIndexer } from "./ContractStateIndexer";
 export * from "./types";
-export { IdempotentEventProcessor } from "./IdempotentEventProcessor";
+export { IdempotentEventProcessor, compareEventCursorOrder } from "./IdempotentEventProcessor";
 export type { EventData, ReconciliationOutput } from "./IdempotentEventProcessor";
 export * from "./EventCursor";
 export { MemoryCursorStorage } from "./MemoryCursorStorage";

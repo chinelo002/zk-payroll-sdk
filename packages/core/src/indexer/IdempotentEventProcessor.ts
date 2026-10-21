@@ -22,6 +22,21 @@ export interface ReconciliationOutput {
   details?: Record<string, unknown>;
 }
 
+/**
+ * Orders two events by the same (ledgerSequence, transactionPosition,
+ * operationPosition, eventPosition) tuple `isCursorCorrupted` compares
+ * against, so a batch of resumed/replayed events sorted with this
+ * comparator processes in the exact order the cursor model expects (#779).
+ */
+export function compareEventCursorOrder(a: EventData, b: EventData): number {
+  return (
+    a.ledgerSequence - b.ledgerSequence ||
+    a.transactionPosition - b.transactionPosition ||
+    a.operationPosition - b.operationPosition ||
+    a.eventPosition - b.eventPosition
+  );
+}
+
 export class IdempotentEventProcessor {
   private options: IdempotentEventProcessorOptions;
 
@@ -99,7 +114,19 @@ export class IdempotentEventProcessor {
   async processEventStream(events: EventData[]): Promise<ReconciliationOutput[]> {
     const outputs: ReconciliationOutput[] = [];
 
-    for (const event of events) {
+    // Resumed/replayed event batches are not guaranteed to arrive in ledger
+    // order (a paginated RPC response, overlapping gap-recovery ranges, or a
+    // concurrent fetch can interleave them). processEvent/isCursorCorrupted
+    // assumes events are processed in (ledgerSequence, transactionPosition,
+    // operationPosition, eventPosition) order and flags any apparent
+    // regression as cursor corruption, so out-of-order input here produces
+    // false corruption reports for events that are not actually corrupted,
+    // only misordered (#779). Sorting is stable (Array.prototype.sort) so
+    // events that tie on the full cursor tuple keep their relative input
+    // order.
+    const orderedEvents = [...events].sort(compareEventCursorOrder);
+
+    for (const event of orderedEvents) {
       const result = await this.processEvent(event);
 
       outputs.push({
